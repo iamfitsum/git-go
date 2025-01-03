@@ -79,7 +79,6 @@ func main() {
 		
 		content := data[nullIndex+1:]
 		fmt.Print(content)
-
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
