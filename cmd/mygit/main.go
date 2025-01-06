@@ -12,7 +12,6 @@ import (
 	"strings"
 )
 
-// hashFile hashes the content of a file, stores it as a Git blob object, and returns the hash.
 func hashFile(fileContents []byte) (string, error) {
 	header := fmt.Sprintf("blob %d\x00", len(fileContents))
 	data := append([]byte(header), fileContents...)
@@ -21,18 +20,15 @@ func hashFile(fileContents []byte) (string, error) {
 	objectDir := fmt.Sprintf(".git/objects/%s", hash[:2])
 	objectPath := fmt.Sprintf("%s/%s", objectDir, hash[2:])
 
-	// Check if the object already exists
 	if _, err := os.Stat(objectPath); err == nil {
-		return hash, nil // If it exists, return the hash
+		return hash, nil
 	}
 
-	// Create the object directory
 	err := os.MkdirAll(objectDir, os.ModePerm)
 	if err != nil {
 		return "", fmt.Errorf("error creating directory: %w", err)
 	}
 
-	// Write the compressed object data
 	objectFile, err := os.Create(objectPath)
 	if err != nil {
 		return "", fmt.Errorf("error creating file: %w", err)
@@ -46,10 +42,9 @@ func hashFile(fileContents []byte) (string, error) {
 	}
 	zw.Close()
 
-	return hash, nil // Return the hash
+	return hash, nil
 }
 
-// getFullHashFromAbbreviated resolves a short (7-character) hash to the full hash.
 func getFullHashFromAbbreviated(abbrev string) (string, error) {
 	if len(abbrev) < 7 {
 		return "", fmt.Errorf("abbreviated hash too short, must be at least 7 characters")
@@ -70,6 +65,18 @@ func getFullHashFromAbbreviated(abbrev string) (string, error) {
 	}
 
 	return "", fmt.Errorf("could not resolve full hash from abbreviated: %s", abbrev)
+}
+
+func hexToBytes(s string) ([]byte, error) {
+	if len(s)%2 != 0 {
+		return nil, fmt.Errorf("odd length hex string")
+	}
+	b := make([]byte, len(s)/2)
+	_, err := hex.Decode(b, []byte(s))
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
@@ -224,38 +231,140 @@ func main() {
 
 		content := data[nullIndex+1:]
 		fmt.Print(content)
+	case "read-tree":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "usage: mygit read-tree <object>\n")
+			os.Exit(1)
+		}
+
+		object := os.Args[2]
+		objectDir := object[:2]
+		objectFileName := object[2:]
+
+		objectPath := fmt.Sprintf(".git/objects/%s/%s", objectDir, objectFileName)
+
+		objectFile, err := os.Open(objectPath)
+		if err != nil {
+			fullHash, err := getFullHashFromAbbreviated(object)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving object hash: %s\n", err)
+				os.Exit(1)
+			}
+
+			objectPath = fmt.Sprintf(".git/objects/%s/%s", objectDir, fullHash)
+			objectFile, err = os.Open(objectPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error opening object file: %s\n", err)
+				os.Exit(1)
+			}
+		}
+		defer objectFile.Close()
+
+		zr, err := zlib.NewReader(objectFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating zlib reader: %s\n", err)
+			os.Exit(1)
+		}
+		defer zr.Close()
+
+		var out bytes.Buffer
+		_, err = io.Copy(&out, zr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error decompressing file: %s\n", err)
+			os.Exit(1)
+		}
+
+		data := out.Bytes()
+
+		nullIndex := bytes.IndexByte(data, 0)
+		if nullIndex == -1 {
+			fmt.Fprintf(os.Stderr, "Invalid object format\n")
+			os.Exit(1)
+		}
+
+		content := data[nullIndex+1:]
+
+		fmt.Println("Tree Object Contents:")
+
+		i := 0
+		for i < len(content) {
+			spaceIndex := bytes.IndexByte(content[i:], ' ')
+			if spaceIndex == -1 {
+				break
+			}
+			mode := string(content[i : i+spaceIndex])
+			startOfPath := i + spaceIndex + 1
+
+			nullIndex := bytes.IndexByte(content[startOfPath:], 0)
+			if nullIndex == -1 {
+				break
+			}
+			path := string(content[startOfPath : startOfPath+nullIndex])
+			startOfHash := startOfPath + nullIndex + 1
+
+			if startOfHash+20 > len(content) {
+				break
+			}
+			hashBytes := content[startOfHash : startOfHash+20]
+			hash := hex.EncodeToString(hashBytes)
+
+			fmt.Printf("Mode: %s | Path: %s | Hash: %s\n", mode, path, hash)
+
+			i = startOfHash + 20
+		}
 	case "write-tree":
 		var buffer bytes.Buffer
+		directories := make(map[string]bool)
 
 		err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
-			if path == "." || strings.HasPrefix(path, ".git/") {
+
+			if path == ".git" {
+				return filepath.SkipDir
+			}
+
+			if strings.HasPrefix(path, ".git/") {
 				return nil
 			}
 
-			mode := "100644" // Default mode for files
+			if path == "." {
+				return nil
+			}
+
+			mode := "100644"
+
 			if info.IsDir() {
-				mode = "40000" // Mode for directories
-				return nil     // Ignore directories for now
+				if _, exists := directories[path]; !exists {
+					directories[path] = true
+					mode = "40000"
+					buffer.WriteString(fmt.Sprintf("%s %s\x00", mode, path))
+					buffer.Write(make([]byte, 20))
+				}
+				return nil
 			}
 
 			fileContents, err := os.ReadFile(path)
 			if err != nil {
 				return fmt.Errorf("error reading file %s: %w", path, err)
 			}
-			hash, err := hashFile(fileContents)
+
+			fileHash, err := hashFile(fileContents)
 			if err != nil {
 				return fmt.Errorf("error hashing file %s: %w", path, err)
 			}
 
-			buffer.WriteString(fmt.Sprintf("%s %s\x00", mode, path))
-			hashBytes, _ := hex.DecodeString(hash)
-			buffer.Write(hashBytes)
+			hashBytes, err := hexToBytes(fileHash)
+			if err != nil {
+				return fmt.Errorf("error converting hex to bytes: %w", err)
+			}
 
+			buffer.WriteString(fmt.Sprintf("%s %s\x00", mode, path))
+			buffer.Write(hashBytes)
 			return nil
 		})
+
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error walking the directory: %s\n", err)
 			os.Exit(1)
